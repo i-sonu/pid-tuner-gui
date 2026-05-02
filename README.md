@@ -8,8 +8,11 @@ Replaces a clunky three-terminal workflow (separate ArUco tracker, C++ PID tuner
 
 - **Three control modes**
   - *Lateral* — translates the vehicle left/right to centre an ArUco marker (camera X axis)
+    <img width="1428" height="1021" alt="image" src="https://github.com/user-attachments/assets/8b3c4d47-c48b-4ca7-9a91-690c2755a53b" />
   - *Forward* — drives the vehicle towards/away from a marker using the true range from `solvePnP` (camera Z axis)
+    <img width="1428" height="1059" alt="image" src="https://github.com/user-attachments/assets/994ba8b2-b53b-4b18-932f-934f484d2905" />
   - *Pipeline* — subscribes to a `geometry_msgs/Point` centroid topic from any perception node and drives both lateral + forward PIDs simultaneously to the pixel centre
+    <img width="1428" height="1059" alt="image" src="https://github.com/user-attachments/assets/edd0e301-f2ea-4fd8-ac5f-5aba5e369adc" />
 - **Depth control** runs orthogonally to whichever horizontal mode is active — set a target pressure (mbar) and tune Kp/Ki/Kd against the live `external_pressure` telemetry
 - **Yaw lock** holds the heading first received from telemetry (optional)
 - **Embedded RTSP video** via a low-latency GStreamer `appsink` pipeline (PyGObject), not OpenCV's FFmpeg backend
