@@ -45,6 +45,7 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from custom_msgs.msg import Commands, Telemetry
+from geometry_msgs.msg import Point as GeoPoint
 
 # rclpy.init MUST happen before Gst.init and before PyQt5 loads.
 # GStreamer's init grabs boost::interprocess shared memory; if it runs
@@ -71,16 +72,49 @@ class TunerNode(Node):
             Commands, "/master/commands", self._on_commands, 1)
         self.on_heading = None  # set by ControlEngine
 
-        # Ring buffer written by ROS spin thread, read by Qt plot timer.
+        # Ring buffers written by ROS spin thread, read by Qt plot timer.
         # deque append/read is GIL-safe for single producer + single consumer.
         self.lateral_plot_buf: deque = deque(maxlen=1000)  # 10 s × 100 Hz
+        self.forward_plot_buf: deque = deque(maxlen=1000)
+
+        # Centroid point from a perception node (pixel coords). Only used
+        # by the engine when axis == "point". Lock protects against the
+        # spin thread writing while the tick thread reads.
+        self._centroid_lock = threading.Lock()
+        self._centroid_xy: Optional[Tuple[float, float]] = None
+        self._centroid_time: float = 0.0
+        self._centroid_topic = "/vision/centroid"
+        self._centroid_sub = self.create_subscription(
+            GeoPoint, self._centroid_topic, self._on_centroid, 1)
 
     def _on_telemetry(self, msg: Telemetry):
         if self.on_heading is not None:
             self.on_heading(int(msg.heading))
 
     def _on_commands(self, msg: Commands):
-        self.lateral_plot_buf.append((_time.monotonic(), float(msg.lateral)))
+        t = _time.monotonic()
+        self.lateral_plot_buf.append((t, float(msg.lateral)))
+        self.forward_plot_buf.append((t, float(msg.forward)))
+
+    def _on_centroid(self, msg: GeoPoint):
+        with self._centroid_lock:
+            self._centroid_xy = (float(msg.x), float(msg.y))
+            self._centroid_time = _time.monotonic()
+
+    def set_centroid_topic(self, topic: str):
+        topic = topic.strip()
+        if not topic or topic == self._centroid_topic:
+            return
+        try:
+            self.destroy_subscription(self._centroid_sub)
+        except Exception:
+            pass
+        self._centroid_topic = topic
+        self._centroid_sub = self.create_subscription(
+            GeoPoint, self._centroid_topic, self._on_centroid, 1)
+        with self._centroid_lock:
+            self._centroid_xy = None
+            self._centroid_time = 0.0
 
     def publish_commands(self, cmd: Commands):
         self._cmd_pub.publish(cmd)
@@ -291,7 +325,7 @@ class PIDController:
             d_term = self._prev_d
         self._prev_d = d_term
 
-        raw = self.base_offset + p_term + i_term + d_term
+        raw = self.base_offset -( p_term + i_term + d_term)
         clamped = max(PWM_NEUTRAL - self.SAFE_PWM,
                       min(PWM_NEUTRAL + self.SAFE_PWM, raw))
         return int(clamped)
@@ -527,13 +561,10 @@ class ControlEngine(QObject):
     so that the Qt event loop stays free for video display."""
 
     log = pyqtSignal(str)
-    # Batched: list of (t, value) tuples, emitted at DISPLAY_HZ
-    error_samples_batch = pyqtSignal(list)
-    pwm_samples_batch = pyqtSignal(list)
     centred = pyqtSignal(float)              # elapsed seconds
     centred_status = pyqtSignal(bool, float) # in_band, elapsed
 
-    AXES = ("lateral", "forward")
+    AXES = ("lateral", "forward", "point")
 
     def __init__(self, node: TunerNode, detector: ArucoDetector):
         super().__init__()
@@ -556,17 +587,22 @@ class ControlEngine(QObject):
         self._target_heading: Optional[int] = None
         self._telemetry_received = False
 
+        # Frame size — set by the window when frames arrive. Needed for
+        # point mode to compute pixel offsets from the frame center.
+        self._frame_lock = threading.Lock()
+        self._frame_w: int = 0
+        self._frame_h: int = 0
+
+        # Latest point-mode error in pixels — set in _tick_point, read
+        # by the window for the on-stream HUD overlay.
+        self._point_err_lock = threading.Lock()
+        self._point_err: Optional[Tuple[int, int]] = None
+
         self._prev_tick = _time.monotonic()
         self._t0 = _time.monotonic()
         self._last_loop_warn = 0.0
         self._in_band_since: Optional[float] = None
         self._centred_already_fired = False
-
-        # Buffers for batched plot emission (filled by _tick thread,
-        # drained by _flush_plots on a slow QTimer).
-        self._err_buf_lock = threading.Lock()
-        self._err_buf: list = []   # [(t, err), ...]
-        self._pwm_buf: list = []   # [(t, pwm), ...]
 
         self.node.on_heading = self._on_heading
 
@@ -574,11 +610,6 @@ class ControlEngine(QObject):
         self._tick_thread = threading.Thread(
             target=self._tick_loop, daemon=True, name="pid_tick")
         self._tick_thread.start()
-
-        # Slow QTimer only to flush buffered plot data to GUI.
-        self._flush_timer = QTimer()
-        self._flush_timer.timeout.connect(self._flush_plots)
-        self._flush_timer.start(int(1000 / DISPLAY_HZ))
 
     # ---- inputs from other components --------------------------------
 
@@ -618,7 +649,18 @@ class ControlEngine(QObject):
         self.lateral_pid.reset()
         self.forward_pid.reset()
         self._reset_centre_tracking()
+        with self._point_err_lock:
+            self._point_err = None
         self.log.emit(f"[AXIS] now tuning {axis}")
+
+    def update_frame_size(self, w: int, h: int):
+        with self._frame_lock:
+            self._frame_w = int(w)
+            self._frame_h = int(h)
+
+    def get_point_error(self) -> Optional[Tuple[int, int]]:
+        with self._point_err_lock:
+            return self._point_err
 
     def set_yaw_lock(self, enabled: bool):
         self.yaw_lock_enabled = enabled
@@ -653,7 +695,9 @@ class ControlEngine(QObject):
             return None
         if self.axis == "lateral":
             return self._last_pose.x  # camera X = sideways (m)
-        return self._last_pose.z      # camera Z = forward range (m)
+        if self.axis == "forward":
+            return self._last_pose.z  # camera Z = forward range (m)
+        return None  # "point" axis uses _tick_point, not _axis_error
 
     def _yaw_error(self) -> int:
         if self._heading is None or self._target_heading is None:
@@ -689,9 +733,6 @@ class ControlEngine(QObject):
             self.log.emit(f"[CRITICAL] loop stalled, gap={dt:.3f}s")
             self._last_loop_warn = now
 
-        pose_age = now - self._last_pose_time if self._last_pose_time else 1e9
-        pose_fresh = self._last_pose is not None and pose_age < STALE_POSE_S
-
         cmd = Commands()
         cmd.mode = "ALT_HOLD"
         cmd.arm = self.armed
@@ -704,8 +745,18 @@ class ControlEngine(QObject):
         cmd.servo1 = PWM_NEUTRAL
         cmd.servo2 = PWM_NEUTRAL
 
+        if self.axis == "point":
+            self._tick_point(cmd, now, dt)
+        else:
+            self._tick_aruco(cmd, now, dt)
+
+        self.node.publish_commands(cmd)
+
+    def _tick_aruco(self, cmd: Commands, now: float, dt: float):
+        pose_age = now - self._last_pose_time if self._last_pose_time else 1e9
+        pose_fresh = self._last_pose is not None and pose_age < STALE_POSE_S
+
         axis_err = self._axis_error()
-        axis_pwm: Optional[int] = None
 
         if self.armed and pose_fresh and axis_err is not None:
             pid = self._active_pid()
@@ -726,31 +777,52 @@ class ControlEngine(QObject):
             self.yaw_pid.reset()
             self._reset_centre_tracking()
 
-        self.node.publish_commands(cmd)
+    def _tick_point(self, cmd: Commands, now: float, dt: float):
+        """Point mode: subscribe to a perception centroid and run BOTH
+        lateral and forward PIDs from pixel offsets to the frame centre."""
+        with self.node._centroid_lock:
+            centroid = self.node._centroid_xy
+            centroid_t = self.node._centroid_time
+        with self._frame_lock:
+            fw, fh = self._frame_w, self._frame_h
 
-        # Buffer plot samples — flushed to GUI at DISPLAY_HZ by _flush_plots.
-        rel_t = now - self._t0
-        plot_err = axis_err if axis_err is not None else 0.0
-        if self.axis == "lateral":
-            plot_pwm = cmd.lateral
+        age = now - centroid_t if centroid_t else 1e9
+        fresh = (centroid is not None and age < STALE_POSE_S
+                 and fw > 0 and fh > 0)
+
+        if self.armed and fresh:
+            cx_pix = fw / 2.0
+            cy_pix = fh / 2.0
+            err_x = float(centroid[0]) - cx_pix   # +ve: point is right of centre
+            err_y = float(centroid[1]) - cy_pix   # +ve: point is below centre
+
+            # Lateral PID drives along the camera-X (left/right) error.
+            cmd.lateral = self.lateral_pid.control(err_x, dt)
+            # Forward PID drives along the camera-Y (up/down) error — this
+            # is what makes sense when the camera looks down at a pipeline.
+            cmd.forward = self.forward_pid.control(err_y, dt)
+
+            if self.yaw_lock_enabled and self._telemetry_received:
+                cmd.yaw = self.yaw_pid.control(self._yaw_error(), dt)
+
+            with self._point_err_lock:
+                self._point_err = (int(err_x), int(err_y))
+
+            # Centre-detection uses Euclidean pixel distance. We don't
+            # really know what "tolerance" means in pixels here — leave
+            # that to the user's tolerance spinbox. They can scale it up.
+            combined = (err_x ** 2 + err_y ** 2) ** 0.5
+            self._update_centre_tracking(combined, now)
         else:
-            plot_pwm = cmd.forward
-        with self._err_buf_lock:
-            self._err_buf.append((rel_t, float(plot_err)))
-            self._pwm_buf.append((rel_t, float(plot_pwm)))
-
-    def _flush_plots(self):
-        """Called on GUI thread at DISPLAY_HZ — drains buffered samples
-        and emits them as a single batch signal."""
-        with self._err_buf_lock:
-            err_batch = self._err_buf
-            pwm_batch = self._pwm_buf
-            self._err_buf = []
-            self._pwm_buf = []
-        if err_batch:
-            self.error_samples_batch.emit(err_batch)
-        if pwm_batch:
-            self.pwm_samples_batch.emit(pwm_batch)
+            if self.armed and not fresh:
+                self._warn_throttled(
+                    now, "[WARN] stale point — holding neutral")
+            self.lateral_pid.reset()
+            self.forward_pid.reset()
+            self.yaw_pid.reset()
+            self._reset_centre_tracking()
+            with self._point_err_lock:
+                self._point_err = None
 
     def _update_centre_tracking(self, err: float, now: float):
         in_band = abs(err) <= self.tolerance
@@ -874,8 +946,6 @@ class TunerWindow(QMainWindow):
 
         # Wire engine signals
         self.engine.log.connect(self._append_log)
-        self.engine.error_samples_batch.connect(self._on_error_batch)
-        self.engine.pwm_samples_batch.connect(self._on_pwm_batch)
         self.engine.centred_status.connect(self._on_centre_status)
 
         # Wire grabber
@@ -889,7 +959,10 @@ class TunerWindow(QMainWindow):
         # Apply initial config
         self._url_edit.setText(self.node.rtsp_url)
         self._id_spin.setValue(self.node.target_id)
+        self._point_topic_edit.setText(self.node._centroid_topic)
         self.grabber.set_url(self.node.rtsp_url)
+        # Default: lateral mode.
+        self._apply_mode_visibility("lateral")
         self.engine.set_axis("lateral")
 
     # ---- panel builders ---------------------------------------------
@@ -945,15 +1018,33 @@ class TunerWindow(QMainWindow):
         axis_row = QHBoxLayout()
         self._radio_lat = QRadioButton("Lateral")
         self._radio_fwd = QRadioButton("Forward")
+        self._radio_pt  = QRadioButton("Point Tuning")
         self._radio_lat.setChecked(True)
         grp = QButtonGroup(self)
         grp.addButton(self._radio_lat)
         grp.addButton(self._radio_fwd)
+        grp.addButton(self._radio_pt)
         self._radio_lat.toggled.connect(self._on_axis_change)
+        self._radio_fwd.toggled.connect(self._on_axis_change)
+        self._radio_pt.toggled.connect(self._on_axis_change)
         axis_row.addWidget(self._radio_lat)
         axis_row.addWidget(self._radio_fwd)
+        axis_row.addWidget(self._radio_pt)
         axis_row.addStretch(1)
         v.addLayout(axis_row)
+
+        # Topic for the point centroid — only relevant in Point Tuning
+        # mode, so we wrap the row in a QWidget that we can hide/show.
+        self._point_topic_row = QWidget()
+        topic_row = QHBoxLayout(self._point_topic_row)
+        topic_row.setContentsMargins(0, 0, 0, 0)
+        topic_row.addWidget(QLabel("Point topic:"))
+        self._point_topic_edit = QLineEdit("/vision/centroid")
+        topic_row.addWidget(self._point_topic_edit, 1)
+        apply_topic = QPushButton("Apply")
+        apply_topic.clicked.connect(self._on_apply_point_topic)
+        topic_row.addWidget(apply_topic)
+        v.addWidget(self._point_topic_row)
 
         self._yaw_check = QCheckBox("Yaw heading lock")
         self._yaw_check.setChecked(True)
@@ -1001,36 +1092,100 @@ class TunerWindow(QMainWindow):
         return box
 
     def _build_gains_panel(self) -> QWidget:
-        box = QGroupBox("Gains (active axis)")
-        v = QVBoxLayout(box)
-        self._kp_row = GainRow("Kp", 0.0, 500.0, 200.0, 0.5)
-        self._ki_row = GainRow("Ki", 0.0, 10.0, 0.0, 0.01)
-        self._kd_row = GainRow("Kd", 0.0, 100.0, 0.0, 0.1)
-        self._kp_row.value_changed.connect(lambda v: self._on_gain("kp", v))
-        self._ki_row.value_changed.connect(lambda v: self._on_gain("ki", v))
-        self._kd_row.value_changed.connect(lambda v: self._on_gain("kd", v))
-        v.addWidget(self._kp_row)
-        v.addWidget(self._ki_row)
-        v.addWidget(self._kd_row)
-        return box
+        """Two side-by-side gain groups (lateral and forward).
+
+        In Lateral mode: only the lateral group is enabled.
+        In Forward mode: only the forward group is enabled.
+        In Point Tuning mode: BOTH groups are enabled (each axis tuned
+        independently)."""
+        wrap = QWidget()
+        h = QHBoxLayout(wrap)
+        h.setContentsMargins(0, 0, 0, 0)
+
+        # ---- Lateral gains
+        self._lat_box = QGroupBox("Lateral gains")
+        lv = QVBoxLayout(self._lat_box)
+        self._lat_kp = GainRow("Kp", 0.0, 500.0,
+                               self.engine.lateral_pid.kp, 0.5)
+        self._lat_ki = GainRow("Ki", 0.0, 10.0,
+                               self.engine.lateral_pid.ki, 0.01)
+        self._lat_kd = GainRow("Kd", 0.0, 100.0,
+                               self.engine.lateral_pid.kd, 0.1)
+        self._lat_kp.value_changed.connect(
+            lambda v: self.engine.set_gain("lateral", "kp", v))
+        self._lat_ki.value_changed.connect(
+            lambda v: self.engine.set_gain("lateral", "ki", v))
+        self._lat_kd.value_changed.connect(
+            lambda v: self.engine.set_gain("lateral", "kd", v))
+        lv.addWidget(self._lat_kp)
+        lv.addWidget(self._lat_ki)
+        lv.addWidget(self._lat_kd)
+        h.addWidget(self._lat_box, 1)
+
+        # ---- Forward gains
+        self._fwd_box = QGroupBox("Forward gains")
+        fv = QVBoxLayout(self._fwd_box)
+        self._fwd_kp = GainRow("Kp", 0.0, 500.0,
+                               self.engine.forward_pid.kp, 0.5)
+        self._fwd_ki = GainRow("Ki", 0.0, 10.0,
+                               self.engine.forward_pid.ki, 0.01)
+        self._fwd_kd = GainRow("Kd", 0.0, 100.0,
+                               self.engine.forward_pid.kd, 0.1)
+        self._fwd_kp.value_changed.connect(
+            lambda v: self.engine.set_gain("forward", "kp", v))
+        self._fwd_ki.value_changed.connect(
+            lambda v: self.engine.set_gain("forward", "ki", v))
+        self._fwd_kd.value_changed.connect(
+            lambda v: self.engine.set_gain("forward", "kd", v))
+        fv.addWidget(self._fwd_kp)
+        fv.addWidget(self._fwd_ki)
+        fv.addWidget(self._fwd_kd)
+        h.addWidget(self._fwd_box, 1)
+
+        return wrap
 
     def _build_plots_panel(self) -> QWidget:
-        box = QGroupBox("Lateral PWM — /master/commands (last 10 s)")
-        v = QVBoxLayout(box)
+        """Two side-by-side PWM plots — lateral and forward — both fed
+        from /master/commands so they show whatever the autopilot
+        actually receives, regardless of which mode is active."""
+        wrap = QWidget()
+        h = QHBoxLayout(wrap)
+        h.setContentsMargins(0, 0, 0, 0)
         pg.setConfigOptions(antialias=True)
 
-        self._pwm_plot = pg.PlotWidget()
-        self._pwm_plot.showGrid(x=True, y=True, alpha=0.3)
-        self._pwm_plot.setYRange(PWM_MIN - 50, PWM_MAX + 50)
-        self._pwm_plot.setLabel("left", "PWM")
-        self._pwm_plot.setLabel("bottom", "time (s, rolling)")
-        self._pwm_curve = self._pwm_plot.plot(pen=pg.mkPen("c", width=2))
-        self._pwm_plot.addLine(y=PWM_NEUTRAL, pen=pg.mkPen("w", style=Qt.DotLine))
-        self._pwm_plot.addLine(y=PWM_MIN, pen=pg.mkPen("r", style=Qt.DashLine))
-        self._pwm_plot.addLine(y=PWM_MAX, pen=pg.mkPen("r", style=Qt.DashLine))
-        v.addWidget(self._pwm_plot)
+        # ---- Lateral PWM plot
+        self._lat_plot_box = QGroupBox(
+            "Lateral PWM — /master/commands (last 10 s)")
+        lv = QVBoxLayout(self._lat_plot_box)
+        self._lat_plot = pg.PlotWidget()
+        self._lat_plot.showGrid(x=True, y=True, alpha=0.3)
+        self._lat_plot.setYRange(PWM_MIN - 50, PWM_MAX + 50)
+        self._lat_plot.setLabel("left", "PWM")
+        self._lat_plot.setLabel("bottom", "time (s, rolling)")
+        self._lat_curve = self._lat_plot.plot(pen=pg.mkPen("c", width=2))
+        self._lat_plot.addLine(y=PWM_NEUTRAL, pen=pg.mkPen("w", style=Qt.DotLine))
+        self._lat_plot.addLine(y=PWM_MIN, pen=pg.mkPen("r", style=Qt.DashLine))
+        self._lat_plot.addLine(y=PWM_MAX, pen=pg.mkPen("r", style=Qt.DashLine))
+        lv.addWidget(self._lat_plot)
+        h.addWidget(self._lat_plot_box, 1)
 
-        return box
+        # ---- Forward PWM plot
+        self._fwd_plot_box = QGroupBox(
+            "Forward PWM — /master/commands (last 10 s)")
+        fv = QVBoxLayout(self._fwd_plot_box)
+        self._fwd_plot = pg.PlotWidget()
+        self._fwd_plot.showGrid(x=True, y=True, alpha=0.3)
+        self._fwd_plot.setYRange(PWM_MIN - 50, PWM_MAX + 50)
+        self._fwd_plot.setLabel("left", "PWM")
+        self._fwd_plot.setLabel("bottom", "time (s, rolling)")
+        self._fwd_curve = self._fwd_plot.plot(pen=pg.mkPen("y", width=2))
+        self._fwd_plot.addLine(y=PWM_NEUTRAL, pen=pg.mkPen("w", style=Qt.DotLine))
+        self._fwd_plot.addLine(y=PWM_MIN, pen=pg.mkPen("r", style=Qt.DashLine))
+        self._fwd_plot.addLine(y=PWM_MAX, pen=pg.mkPen("r", style=Qt.DashLine))
+        fv.addWidget(self._fwd_plot)
+        h.addWidget(self._fwd_plot_box, 1)
+
+        return wrap
 
     def _build_log_panel(self) -> QWidget:
         box = QGroupBox("Log")
@@ -1071,24 +1226,45 @@ class TunerWindow(QMainWindow):
         self._append_log(f"[ARUCO] target id = {value}")
 
     def _on_axis_change(self, _checked: bool):
-        axis = "lateral" if self._radio_lat.isChecked() else "forward"
+        # Only react on the radio that became checked (toggled fires
+        # twice per change — once for the new and once for the old).
+        if not (self._radio_lat.isChecked() or self._radio_fwd.isChecked()
+                or self._radio_pt.isChecked()):
+            return
+        if self._radio_lat.isChecked():
+            axis = "lateral"
+        elif self._radio_fwd.isChecked():
+            axis = "forward"
+        else:
+            axis = "point"
         self.engine.set_axis(axis)
-        self._reflect_axis_gains(axis)
+        self._apply_mode_visibility(axis)
 
-    def _reflect_axis_gains(self, axis: str):
-        pid = (self.engine.lateral_pid if axis == "lateral"
-               else self.engine.forward_pid)
-        self._kp_row.set_value(pid.kp)
-        self._ki_row.set_value(pid.ki)
-        self._kd_row.set_value(pid.kd)
+    def _apply_mode_visibility(self, axis: str):
+        """Show only the panels relevant to the current axis.
+
+        Lateral mode → lateral gain group + lateral plot only.
+        Forward mode → forward gain group + forward plot only.
+        Point mode   → both gain groups + both plots + point-topic row.
+        """
+        lat_on = axis in ("lateral", "point")
+        fwd_on = axis in ("forward", "point")
+        self._lat_box.setVisible(lat_on)
+        self._fwd_box.setVisible(fwd_on)
+        self._lat_plot_box.setVisible(lat_on)
+        self._fwd_plot_box.setVisible(fwd_on)
+        self._point_topic_row.setVisible(axis == "point")
+
+    def _on_apply_point_topic(self):
+        topic = self._point_topic_edit.text().strip()
+        if not topic:
+            return
+        self.node.set_centroid_topic(topic)
+        self._append_log(f"[POINT] topic set to {topic}")
 
     def _on_arm_toggle(self, checked: bool):
         self.engine.set_armed(checked)
         self._style_arm_button(checked)
-
-    def _on_gain(self, name: str, value: float):
-        axis = "lateral" if self._radio_lat.isChecked() else "forward"
-        self.engine.set_gain(axis, name, value)
 
     def _on_marker_length(self, value: float):
         self.engine.detector.set_marker_length(value)
@@ -1109,6 +1285,9 @@ class TunerWindow(QMainWindow):
         # (instead of on a 15 Hz QTimer) shaves up to 67 ms of latency and
         # keeps the Qt event queue from accumulating frame_ready signals.
         self.engine.submit_pose(pose)
+        # Engine needs frame dims to compute pixel offsets in point mode.
+        h, w = frame_bgr.shape[:2]
+        self.engine.update_frame_size(w, h)
         self._latest_frame = frame_bgr
         self._latest_pose = pose
         self._refresh_video()
@@ -1117,6 +1296,11 @@ class TunerWindow(QMainWindow):
         if self._latest_frame is None:
             return
         frame = self._latest_frame
+        # In Point Tuning mode, overlay the centroid + pixel error HUD.
+        # We mutate a copy because the engine still holds a reference.
+        if self.engine.axis == "point":
+            frame = frame.copy()
+            self._draw_point_overlay(frame)
         h, w = frame.shape[:2]
         # downscale to fit the label while preserving aspect ratio
         target_w = max(320, self.video_label.width())
@@ -1132,33 +1316,63 @@ class TunerWindow(QMainWindow):
         img = QImage(rgb.data, w2, h2, w2 * 3, QImage.Format_RGB888).copy()
         self.video_label.setPixmap(QPixmap.fromImage(img))
 
-    @pyqtSlot(list)
-    def _on_error_batch(self, batch: list):
-        for t, err in batch:
-            self._error_t.append(t)
-            self._error_y.append(err)
+    def _draw_point_overlay(self, frame: np.ndarray):
+        """Repaint the top-left HUD with x/y pixel errors and draw the
+        latest centroid as a yellow dot connected to the frame centre."""
+        h, w = frame.shape[:2]
+        cx_pix, cy_pix = w // 2, h // 2
 
-    @pyqtSlot(list)
-    def _on_pwm_batch(self, batch: list):
-        for t, pwm in batch:
-            self._pwm_t.append(t)
-            self._pwm_y.append(pwm)
+        # Get the most recent centroid from the node (may be None).
+        with self.node._centroid_lock:
+            centroid = self.node._centroid_xy
+
+        # Mask out the existing HUD so the marker x/y/z text doesn't show
+        # through. Same height the detector's HUD occupies.
+        cv2.rectangle(frame, (0, 0), (w, 50), (0, 0, 0), -1)
+
+        if centroid is not None:
+            px, py = int(centroid[0]), int(centroid[1])
+            err_x = px - cx_pix
+            err_y = py - cy_pix
+            cv2.circle(frame, (px, py), 8, (0, 255, 255), -1)
+            cv2.line(frame, (cx_pix, cy_pix), (px, py),
+                     (0, 255, 255), 2)
+            hud = f"err_x: {err_x:+d} px   err_y: {err_y:+d} px"
+        else:
+            hud = "err_x: ?? px   err_y: ?? px   (no point received)"
+
+        cv2.putText(frame, hud, (12, 32), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(frame, hud, (12, 32), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (0, 255, 255), 1, cv2.LINE_AA)
 
     def _refresh_plots(self):
-        # Read a snapshot of the ring buffer written by the ROS spin thread.
-        pts = list(self.node.lateral_plot_buf)
-        if not pts:
+        # Pick a single t_now so both plots share the same right edge.
+        lat_pts = list(self.node.lateral_plot_buf)
+        fwd_pts = list(self.node.forward_plot_buf)
+        if not lat_pts and not fwd_pts:
             return
-        t_now = pts[-1][0]
+        t_now = max(
+            lat_pts[-1][0] if lat_pts else 0.0,
+            fwd_pts[-1][0] if fwd_pts else 0.0,
+        )
         cutoff = t_now - PLOT_WINDOW_S
+        self._update_curve(self._lat_curve, self._lat_plot, lat_pts,
+                           cutoff, t_now)
+        self._update_curve(self._fwd_curve, self._fwd_plot, fwd_pts,
+                           cutoff, t_now)
+
+    @staticmethod
+    def _update_curve(curve, plot_widget, pts, cutoff, t_now):
         pts = [(t, v) for t, v in pts if t >= cutoff]
         if not pts:
+            curve.setData([], [])
+            plot_widget.setXRange(-PLOT_WINDOW_S, 0, padding=0)
             return
         ts, vs = zip(*pts)
-        # X-axis: seconds before now (negative = past), so the right edge is 0.
         ts_rel = [t - t_now for t in ts]
-        self._pwm_curve.setData(list(ts_rel), list(vs))
-        self._pwm_plot.setXRange(-PLOT_WINDOW_S, 0, padding=0)
+        curve.setData(list(ts_rel), list(vs))
+        plot_widget.setXRange(-PLOT_WINDOW_S, 0, padding=0)
 
     @pyqtSlot(bool, float)
     def _on_centre_status(self, in_band: bool, elapsed: float):
